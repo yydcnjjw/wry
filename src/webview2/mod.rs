@@ -52,9 +52,8 @@ impl From<windows::core::Error> for Error {
 
 pub(crate) struct InnerWebView {
   id: String,
-  parent: RefCell<HWND>,
+  parent: Option<RefCell<HWND>>,
   hwnd: HWND,
-  is_child: bool,
   pub controller: ICoreWebView2Controller,
   webview: ICoreWebView2,
   env: ICoreWebView2Environment,
@@ -67,10 +66,10 @@ pub(crate) struct InnerWebView {
 impl Drop for InnerWebView {
   fn drop(&mut self) {
     let _ = unsafe { self.controller.Close() };
-    if self.is_child {
+    if let Some(parent) = &self.parent {
       let _ = unsafe { DestroyWindow(self.hwnd) };
+      unsafe { Self::dettach_parent_subclass(*parent.borrow()) }
     }
-    unsafe { Self::dettach_parent_subclass(*self.parent.borrow()) }
   }
 }
 
@@ -85,7 +84,18 @@ impl InnerWebView {
       RawWindowHandle::Win32(window) => HWND(window.hwnd.get() as _),
       _ => return Err(Error::UnsupportedWindowHandle),
     };
-    Self::new_in_hwnd(window, attributes, pl_attrs, false)
+
+    let this = Self::new_in_hwnd(window, attributes, pl_attrs)?;
+
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(this.hwnd, &mut rect)? };
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+
+    this.set_bounds_inner((width, height).into(), (0, 0).into())?;
+
+    unsafe { Self::attach_parent_subclass(this.hwnd, &this.controller) };
+    Ok(this)
   }
 
   #[inline]
@@ -99,22 +109,26 @@ impl InnerWebView {
       _ => return Err(Error::UnsupportedWindowHandle),
     };
 
-    Self::new_in_hwnd(parent, attributes, pl_attrs, true)
+    let hwnd = Self::create_child_container_hwnd(parent, &attributes)?;
+
+    let bounds = attributes.bounds.clone();
+
+    let mut this = Self::new_in_hwnd(hwnd, attributes, pl_attrs)?;
+    this.parent = Some(RefCell::new(parent));
+
+    this.set_bounds(bounds.unwrap_or_default())?;
+    Ok(this)
   }
 
   #[inline]
   fn new_in_hwnd(
-    parent: HWND,
+    hwnd: HWND,
     mut attributes: WebViewAttributes,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
-    is_child: bool,
   ) -> Result<Self> {
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 
-    let hwnd = Self::create_container_hwnd(parent, &attributes, is_child)?;
-
     let drop_handler = attributes.drag_drop_handler.take();
-    let bounds = attributes.bounds;
 
     let id = attributes
       .id
@@ -122,17 +136,9 @@ impl InnerWebView {
       .unwrap_or_else(|| (hwnd.0 as isize).to_string());
 
     let env = Self::create_environment(&attributes, pl_attrs.clone())?;
-    let controller = Self::create_controller(hwnd, &env, attributes.incognito)?;
-    let webview = Self::init_webview(
-      parent,
-      hwnd,
-      id.clone(),
-      attributes,
-      &env,
-      &controller,
-      pl_attrs,
-      is_child,
-    )?;
+    let controller =
+      Self::create_controller(hwnd, &env, attributes.incognito, pl_attrs.composition)?;
+    let webview = Self::init_webview(hwnd, id.clone(), attributes, &env, &controller, pl_attrs)?;
 
     let drag_drop_controller = drop_handler.map(|handler| {
       // Disable file drops, so our handler can capture it
@@ -146,30 +152,19 @@ impl InnerWebView {
 
     let w = Self {
       id,
-      parent: RefCell::new(parent),
+      parent: None,
       hwnd,
       controller,
-      is_child,
       webview,
       env,
       drag_drop_controller,
     };
 
-    if is_child {
-      w.set_bounds(bounds.unwrap_or_default())?;
-    } else {
-      w.resize_to_parent()?;
-    }
-
     Ok(w)
   }
 
   #[inline]
-  fn create_container_hwnd(
-    parent: HWND,
-    attributes: &WebViewAttributes,
-    is_child: bool,
-  ) -> Result<HWND> {
+  fn create_child_container_hwnd(parent: HWND, attributes: &WebViewAttributes) -> Result<HWND> {
     unsafe extern "system" fn default_window_proc(
       hwnd: HWND,
       msg: u32,
@@ -206,7 +201,7 @@ impl InnerWebView {
     let dpi = unsafe { util::hwnd_dpi(parent) };
     let scale_factor = util::dpi_to_scale_factor(dpi);
 
-    let (x, y, width, height) = if is_child {
+    let (x, y, width, height) = {
       let (x, y) = attributes
         .bounds
         .map(|b| b.position.to_physical::<f64>(scale_factor))
@@ -219,12 +214,6 @@ impl InnerWebView {
         .unwrap_or((CW_USEDEFAULT, CW_USEDEFAULT));
 
       (x, y, width, height)
-    } else {
-      let mut rect = RECT::default();
-      unsafe { GetClientRect(parent, &mut rect)? };
-      let width = rect.right - rect.left;
-      let height = rect.bottom - rect.top;
-      (0, 0, width, height)
     };
 
     let hwnd = unsafe {
@@ -345,6 +334,7 @@ impl InnerWebView {
     hwnd: HWND,
     env: &ICoreWebView2Environment,
     incognito: bool,
+    composition: bool,
   ) -> Result<ICoreWebView2Controller> {
     let (tx, rx) = mpsc::channel();
     let env = env.clone();
@@ -353,21 +343,51 @@ impl InnerWebView {
     // we don't use CreateCoreWebView2ControllerCompletedHandler::wait_for_async
     // as it uses an mspc::channel under the hood, so we can avoid using two channels
     // by manually creating the callback handler and use webview2_com::with_with_bump
-    let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
-      move |error_code, controller| {
-        error_code?;
-        tx.send(controller.ok_or_else(|| windows::core::Error::from(E_POINTER)))
-          .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
-      },
-    ));
 
-    unsafe {
-      if let Ok(env10) = env10 {
-        let controller_opts = env10.CreateCoreWebView2ControllerOptions()?;
-        controller_opts.SetIsInPrivateModeEnabled(incognito)?;
-        env10.CreateCoreWebView2ControllerWithOptions(hwnd, &controller_opts, &handler)?;
-      } else {
-        env.CreateCoreWebView2Controller(hwnd, &handler)?
+    if composition {
+      let handler = CreateCoreWebView2CompositionControllerCompletedHandler::create(Box::new(
+        move |error_code, controller| {
+          error_code?;
+          tx.send(
+            controller
+              .and_then(|c| c.cast::<ICoreWebView2Controller>().ok())
+              .ok_or_else(|| windows::core::Error::from(E_POINTER)),
+          )
+          .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+        },
+      ));
+      unsafe {
+        if let Ok(env10) = env10 {
+          let controller_opts = env10.CreateCoreWebView2ControllerOptions()?;
+          controller_opts.SetIsInPrivateModeEnabled(incognito)?;
+          env10.CreateCoreWebView2CompositionControllerWithOptions(
+            hwnd,
+            &controller_opts,
+            &handler,
+          )?;
+        } else if let Ok(env3) = env.cast::<ICoreWebView2Environment3>() {
+          env3.CreateCoreWebView2CompositionController(hwnd, &handler)?
+        } else {
+          return Err(windows::core::Error::from(E_UNEXPECTED).into());
+        }
+      }
+    } else {
+      let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
+        move |error_code, controller| {
+          error_code?;
+          tx.send(controller.ok_or_else(|| windows::core::Error::from(E_POINTER)))
+            .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+        },
+      ));
+
+      unsafe {
+        if let Ok(env10) = env10 {
+          let controller_opts = env10.CreateCoreWebView2ControllerOptions()?;
+          controller_opts.SetIsInPrivateModeEnabled(incognito)?;
+          env10.CreateCoreWebView2ControllerWithOptions(hwnd, &controller_opts, &handler)?;
+        } else {
+          env.CreateCoreWebView2Controller(hwnd, &handler)?
+        }
       }
     }
 
@@ -376,14 +396,12 @@ impl InnerWebView {
 
   #[inline]
   fn init_webview(
-    parent: HWND,
     hwnd: HWND,
     webview_id: String,
     mut attributes: WebViewAttributes,
     env: &ICoreWebView2Environment,
     controller: &ICoreWebView2Controller,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
-    is_child: bool,
   ) -> Result<ICoreWebView2> {
     let webview = unsafe { controller.CoreWebView2()? };
 
@@ -497,11 +515,6 @@ impl InnerWebView {
     } else if let Some(html) = attributes.html {
       let html = HSTRING::from(html);
       unsafe { webview.NavigateToString(&html)? };
-    }
-
-    // Subclass parent for resizing and focus
-    if !is_child {
-      unsafe { Self::attach_parent_subclass(parent, controller) };
     }
 
     unsafe {
@@ -1127,7 +1140,7 @@ impl InnerWebView {
           });
 
           let mut hwnd = HWND::default();
-          if (*controller).ParentWindow(&mut hwnd).is_ok() {
+          if (*controller).ParentWindow(&mut hwnd).is_err() {
             let _ = SetWindowPos(
               hwnd,
               HWND::default(),
@@ -1305,14 +1318,14 @@ impl InnerWebView {
   pub fn bounds(&self) -> Result<Rect> {
     let mut bounds = Rect::default();
     let mut rect = RECT::default();
-    if self.is_child {
+    if let Some(parent) = &self.parent {
       unsafe { GetClientRect(self.hwnd, &mut rect)? };
 
       let position_point = &mut [POINT {
         x: rect.left,
         y: rect.top,
       }];
-      unsafe { MapWindowPoints(self.hwnd, *self.parent.borrow(), position_point) };
+      unsafe { MapWindowPoints(self.hwnd, *parent.borrow(), position_point) };
 
       bounds.position = PhysicalPosition::new(position_point[0].x, position_point[0].y).into();
     } else {
@@ -1360,44 +1373,6 @@ impl InnerWebView {
     Ok(())
   }
 
-  fn resize_to_parent(&self) -> crate::Result<()> {
-    let mut rect = RECT::default();
-    let parent = *self.parent.borrow();
-    unsafe { GetClientRect(parent, &mut rect)? };
-    let mut width = rect.right - rect.left;
-    let mut height = rect.bottom - rect.top;
-
-    // adjust for borders
-    let mut pt: POINT = unsafe { std::mem::zeroed() };
-    if unsafe { ClientToScreen(parent, &mut pt) }.as_bool() {
-      let mut window_rc: RECT = unsafe { std::mem::zeroed() };
-      if unsafe { GetWindowRect(parent, &mut window_rc) }.is_ok() {
-        let top_b = pt.y - window_rc.top;
-
-        // this is a hack to check if the window is undecorated
-        // specifically for winit and tao
-        // or any window that uses `WM_NCCALCSIZE` to create undecorated windows
-        //
-        // tao and winit, set the top border to 0 for undecorated
-        // or 1 for undecorated but has shadows
-        //
-        // normal windows should have a top border of around 32 px
-        //
-        // TODO: find a better way to check if a window is decorated or not
-        if top_b <= 1 {
-          let left_b = pt.x - window_rc.left;
-          let right_b = pt.x + width - window_rc.right;
-          let bottom_b = pt.y + height - window_rc.bottom;
-
-          width = width - left_b - right_b;
-          height = height - top_b - bottom_b;
-        }
-      }
-    }
-
-    self.set_bounds_inner((width, height).into(), (0, 0).into())
-  }
-
   pub fn set_visible(&self, visible: bool) -> Result<()> {
     unsafe {
       let _ = ShowWindow(
@@ -1425,9 +1400,11 @@ impl InnerWebView {
 
   pub fn focus_parent(&self) -> Result<()> {
     unsafe {
-      let parent = *self.parent.borrow();
-      if parent != HWND::default() {
-        SetFocus(parent)?;
+      if let Some(parent) = self.parent.as_ref() {
+        let parent = *parent.borrow();
+        if parent != HWND::default() {
+          SetFocus(parent)?;
+        }
       }
     }
 
@@ -1545,21 +1522,6 @@ impl InnerWebView {
 
     unsafe {
       SetParent(self.hwnd, parent)?;
-
-      if !self.is_child {
-        Self::dettach_parent_subclass(*self.parent.borrow());
-        Self::attach_parent_subclass(parent, &self.controller);
-
-        *self.parent.borrow_mut() = parent;
-
-        let mut rect = RECT::default();
-        GetClientRect(parent, &mut rect)?;
-
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-
-        self.set_bounds_inner((width, height).into(), (0, 0).into())?;
-      }
     }
 
     Ok(())
@@ -1667,14 +1629,14 @@ unsafe fn set_background_color(
   controller: &ICoreWebView2Controller,
   background_color: RGBA,
 ) -> Result<()> {
-  let (R, G, B, mut A) = background_color;
-  if is_windows_7() || A != 0 {
-    A = 255;
+  let (r, g, b, mut a) = background_color;
+  if is_windows_7() || a != 0 {
+    a = 255;
   }
 
   let controller2: ICoreWebView2Controller2 = controller.cast()?;
   controller2
-    .SetDefaultBackgroundColor(COREWEBVIEW2_COLOR { R, G, B, A })
+    .SetDefaultBackgroundColor(COREWEBVIEW2_COLOR { R: r, G: g, B: b, A: a })
     .map_err(Into::into)
 }
 

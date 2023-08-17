@@ -1226,6 +1226,7 @@ pub(crate) struct PlatformSpecificWebViewAttributes {
   scroll_bar_style: ScrollBarStyle,
   browser_extensions_enabled: bool,
   extension_path: Option<PathBuf>,
+  composition: bool,
 }
 
 #[cfg(windows)]
@@ -1239,6 +1240,7 @@ impl Default for PlatformSpecificWebViewAttributes {
       scroll_bar_style: ScrollBarStyle::default(),
       browser_extensions_enabled: false,
       extension_path: None,
+      composition: false,
     }
   }
 }
@@ -1303,6 +1305,7 @@ pub trait WebViewBuilderExtWindows {
   ///
   /// Does nothing if browser extensions are disabled. See [`with_browser_extensions_enabled`](Self::with_browser_extensions_enabled)
   fn with_extensions_path(self, path: impl Into<PathBuf>) -> Self;
+  fn with_composition(self, enabled: bool) -> Self;
 }
 
 #[cfg(windows)]
@@ -1355,6 +1358,13 @@ impl WebViewBuilderExtWindows for WebViewBuilder<'_> {
       Ok(b)
     })
   }
+
+  fn with_composition(self, enabled: bool) -> Self {
+    self.and_then(|mut b| {
+      b.platform_specific.composition = enabled;
+      Ok(b)
+    })
+  }
 }
 
 #[cfg(target_os = "android")]
@@ -1364,7 +1374,7 @@ pub(crate) struct PlatformSpecificWebViewAttributes {
     Option<Box<dyn Fn(prelude::Context) -> std::result::Result<(), jni::errors::Error> + Send>>,
   with_asset_loader: bool,
   asset_loader_domain: Option<String>,
-  https_scheme: bool,
+  use_https: bool,
 }
 
 #[cfg(target_os = "android")]
