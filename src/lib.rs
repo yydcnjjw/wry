@@ -1186,6 +1186,7 @@ pub(crate) struct PlatformSpecificWebViewAttributes {
   use_https: bool,
   scroll_bar_style: ScrollBarStyle,
   browser_extensions_enabled: bool,
+  extension_path: Option<PathBuf>,
 }
 
 #[cfg(windows)]
@@ -1198,6 +1199,7 @@ impl Default for PlatformSpecificWebViewAttributes {
       use_https: false, // To match macOS & Linux behavior in the context of mixed content.
       scroll_bar_style: ScrollBarStyle::default(),
       browser_extensions_enabled: false,
+      extension_path: None,
     }
   }
 }
@@ -1257,6 +1259,11 @@ pub trait WebViewBuilderExtWindows {
   /// Requires WebView2 Runtime version 1.0.2210.55 or higher, does nothing on older versions,
   /// see https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/archive?tabs=dotnetcsharp#10221055
   fn with_browser_extensions_enabled(self, enabled: bool) -> Self;
+
+  /// Set the path from which to load extensions from. Extensions stored in this path should be unpacked.
+  ///
+  /// Does nothing if browser extensions are disabled. See [`with_browser_extensions_enabled`](Self::with_browser_extensions_enabled)
+  fn with_extension_path(self, path: impl Into<PathBuf>) -> Self;
 }
 
 #[cfg(windows)]
@@ -1299,6 +1306,13 @@ impl WebViewBuilderExtWindows for WebViewBuilder<'_> {
   fn with_browser_extensions_enabled(self, enabled: bool) -> Self {
     self.and_then(|mut b| {
       b.platform_specific.browser_extensions_enabled = enabled;
+      Ok(b)
+    })
+  }
+
+  fn with_extension_path(self, path: impl Into<PathBuf>) -> Self {
+    self.and_then(|mut b| {
+      b.platform_specific.extension_path = Some(path.into());
       Ok(b)
     })
   }
@@ -1388,6 +1402,18 @@ impl WebViewBuilderExtAndroid for WebViewBuilder<'_> {
   target_os = "netbsd",
   target_os = "openbsd",
 ))]
+#[derive(Default)]
+pub(crate) struct PlatformSpecificWebViewAttributes {
+  extension_path: Option<PathBuf>,
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd",
+))]
 pub trait WebViewBuilderExtUnix<'a> {
   /// Consume the builder and create the webview inside a GTK container widget, such as GTK window.
   ///
@@ -1402,6 +1428,9 @@ pub trait WebViewBuilderExtUnix<'a> {
   fn build_gtk<W>(self, widget: &'a W) -> Result<WebView>
   where
     W: gtk::prelude::IsA<gtk::Container>;
+
+  /// Set the path from which to load extensions from.
+  fn with_extension_path(self, path: impl Into<PathBuf>) -> Self;
 }
 
 #[cfg(any(
@@ -1420,6 +1449,13 @@ impl<'a> WebViewBuilderExtUnix<'a> for WebViewBuilder<'a> {
 
     InnerWebView::new_gtk(widget, parts.attrs, parts.platform_specific)
       .map(|webview| WebView { webview })
+  }
+
+  fn with_extension_path(self, path: impl Into<PathBuf>) -> Self {
+    self.and_then(|mut b| {
+      b.platform_specific.extension_path = Some(path.into());
+      Ok(b)
+    })
   }
 }
 
@@ -1878,16 +1914,6 @@ pub enum PageLoadEvent {
   /// Indicates that the page content has finished loading
   Finished,
 }
-
-#[cfg(any(
-  target_os = "linux",
-  target_os = "dragonfly",
-  target_os = "freebsd",
-  target_os = "netbsd",
-  target_os = "openbsd",
-))]
-#[derive(Default)]
-pub(crate) struct PlatformSpecificWebViewAttributes;
 
 #[cfg(test)]
 mod tests {

@@ -209,7 +209,7 @@ impl InnerWebView {
   pub fn new_gtk<W>(
     container: &W,
     mut attributes: WebViewAttributes,
-    _pl_attrs: super::PlatformSpecificWebViewAttributes,
+    pl_attrs: super::PlatformSpecificWebViewAttributes,
   ) -> Result<Self>
   where
     W: IsA<gtk::Container>,
@@ -240,6 +240,11 @@ impl InnerWebView {
         website_data_manager
           .set_network_proxy_settings(NetworkProxyMode::Custom, Some(&mut settings));
       }
+    }
+
+    // Extension loading
+    if let Some(extension_path) = pl_attrs.extension_path {
+      web_context.os.set_web_extensions_directory(&extension_path);
     }
 
     let webview = Self::create_webview(web_context, &attributes);
