@@ -357,15 +357,19 @@ pub struct WebViewAttributes<'a> {
   /// - **Windows:** the string can not be larger than 2 MB (2 * 1024 * 1024 bytes) in total size
   pub html: Option<String>,
 
-  /// Initialize javascript code when loading new pages. When webview load a new page, this
-  /// initialization code will be executed. It is guaranteed that code is executed before
-  /// `window.onload`.
+  /// A list of initialization javascript scripts to run when loading new pages.
+  /// When webview load a new page, this initialization code will be executed.
+  /// It is guaranteed that code is executed before `window.onload`.
+  ///
+  /// Second parameter represents if script should be added to main frame only or sub frames also.
+  /// `true` for main frame only, `false` for sub frames.
   ///
   /// ## Platform-specific
   ///
+  /// - **Windows**: scripts are injected into sub frames.
   /// - **Android:** The Android WebView does not provide an API for initialization scripts,
   /// so we prepend them to each HTML head. They are only implemented on custom protocol URLs.
-  pub initialization_scripts: Vec<String>,
+  pub initialization_scripts: Vec<(String, bool)>,
 
   /// A list of custom loading protocols with pairs of scheme uri string and a handling
   /// closure.
@@ -693,6 +697,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// ## Platform-specific
   ///
+  /// - **Windows:** scripts are added to subframes as well.
   /// - **Android:** When [addDocumentStartJavaScript] is not supported,
   /// we prepend them to each HTML head (implementation only supported on custom protocol URLs).
   /// For remote URLs, we use [onPageStarted] which is not guaranteed to run before other scripts.
@@ -700,9 +705,20 @@ impl<'a> WebViewBuilder<'a> {
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   /// [onPageStarted]: https://developer.android.com/reference/android/webkit/WebViewClient#onPageStarted(android.webkit.WebView,%20java.lang.String,%20android.graphics.Bitmap)
   pub fn with_initialization_script(self, js: &str) -> Self {
+    self.with_initialization_script_for_main_only(js, true)
+  }
+
+  /// Same as [`with_initialization_script`](Self::with_initialization_script) but with option to inject into main frame only or sub frames.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Windows:** scripts are always added to subframes regardless of the option.
+  pub fn with_initialization_script_for_main_only(self, js: &str, main_only: bool) -> Self {
     self.and_then(|mut b| {
       if !js.is_empty() {
-        b.attrs.initialization_scripts.push(js.to_string());
+        b.attrs
+          .initialization_scripts
+          .push((js.to_string(), main_only));
       }
       Ok(b)
     })
